@@ -51,7 +51,7 @@ const validateId = (id) => {
  * @param {any} priority
  */
 const validatePriority = (priority) => {
-  if (Number.isNaN(priority)) {
+  if (!Number.isInteger(priority) || priority < 1) {
     return {
       valid: false,
       messageObj: {
@@ -64,6 +64,8 @@ const validatePriority = (priority) => {
     valid: true,
   }
 }
+
+const VALID_STATUSES = ['backlog', 'in-progress', 'complete'];
 
 /**
  * Get all of the clients. Optional filter 'status'
@@ -95,7 +97,7 @@ app.get('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
   return res.status(200).send(db.prepare('select * from clients where id = ?').get(id));
 });
@@ -118,17 +120,69 @@ app.put('/api/v1/clients/:id', (req, res) => {
   const id = parseInt(req.params.id , 10);
   const { valid, messageObj } = validateId(id);
   if (!valid) {
-    res.status(400).send(messageObj);
+    return res.status(400).send(messageObj);
   }
 
   let { status, priority } = req.body;
+
+  // Validate the optional inputs before touching the database
+  if (status !== undefined && !VALID_STATUSES.includes(status)) {
+    return res.status(400).send({
+      'message': 'Invalid status provided.',
+      'long_message': 'Status can only be one of the following: [backlog | in-progress | complete].',
+    });
+  }
+  if (priority !== undefined) {
+    const priorityCheck = validatePriority(priority);
+    if (!priorityCheck.valid) {
+      return res.status(400).send(priorityCheck.messageObj);
+    }
+  }
+
   let clients = db.prepare('select * from clients').all();
   const client = clients.find(client => client.id === id);
 
   /* ---------- Update code below ----------*/
 
+  const targetStatus = status === undefined ? client.status : status;
+  const statusChanged = targetStatus !== client.status;
 
+  // Nothing to change: same status and no new priority
+  if (!statusChanged && priority === undefined) {
+    return res.status(200).send(clients);
+  }
 
+  // Clients in a swimlane, ordered by priority, leaving out the client being moved
+  const laneWithout = (laneStatus) => clients
+    .filter(c => c.status === laneStatus && c.id !== client.id)
+    .sort((a, b) => a.priority - b.priority);
+
+  const targetLane = laneWithout(targetStatus);
+
+  // Where does the client go in the target lane? (0-based index)
+  // - no priority given: the end of the lane (lowest priority)
+  // - priority given: that position, or the end if the number is past the end of the lane
+  const insertIndex = priority === undefined
+    ? targetLane.length
+    : Math.min(priority - 1, targetLane.length);
+  targetLane.splice(insertIndex, 0, { ...client, status: targetStatus });
+
+  const updateStatement = db.prepare('update clients set status = ?, priority = ? where id = ?');
+  const saveLane = (lane, laneStatus) => {
+    // Renumber the lane 1..n so priorities stay unique and contiguous
+    lane.forEach((c, index) => updateStatement.run(laneStatus, index + 1, c.id));
+  };
+
+  // Do all of the updates together so the database is never left half-changed
+  db.transaction(() => {
+    saveLane(targetLane, targetStatus);
+    if (statusChanged) {
+      // Close the gap left behind in the lane the client moved out of
+      saveLane(laneWithout(client.status), client.status);
+    }
+  })();
+
+  clients = db.prepare('select * from clients').all();
   return res.status(200).send(clients);
 });
 
